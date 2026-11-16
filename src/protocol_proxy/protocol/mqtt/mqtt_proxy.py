@@ -8,8 +8,14 @@ manager's IPC protocol:
   manager -> broker:  ``PUBLISH_REMOTE`` ``{'topic', 'payload', 'qos'?, 'retain'?}``,
                       ``SUBSCRIBE_REMOTE`` / ``UNSUBSCRIBE_REMOTE`` ``{'topics': [...]}`` where each
                       entry is a topic filter string, a ``[topic, qos]`` pair, or ``{'topic', 'qos'}``.
+
+While the broker is unreachable the proxy keeps retrying with exponential backoff (``reconnect_min_delay`` to
+``reconnect_max_delay``). Publishes requested meanwhile are not delivered later at QoS 0 (dropped) and are held
+by the client at QoS 1 and 2 (sent once the broker is back). An outage is reported as one warning when it
+starts and one line when it ends, with the counts, rather than one warning per undelivered publish.
 """
 import sys
+import time
 
 import json
 import logging
@@ -36,7 +42,7 @@ class MQTTProxy(GeventProtocolProxy):
     def __init__(self, *, host: str = 'localhost', port: int = 1883, keepalive: int = 60, bind_address: str = '',
                  bind_port: int = 0, client_id: str = '', username: str | None = None, password: str | None = None,
                  tls: bool = False, protocol: str = 'MQTTv311', qos: int = 0,
-                 reconnect_min_delay: float = 1.0, reconnect_max_delay: float = 60.0, **kwargs):
+                 reconnect_min_delay: float = 1.0, reconnect_max_delay: float = 10.0, **kwargs):
         super().__init__(**kwargs)
         self.host, self.port, self.keepalive = host, port, keepalive
         self.bind_address, self.bind_port = bind_address, bind_port
@@ -44,6 +50,9 @@ class MQTTProxy(GeventProtocolProxy):
         self.reconnect_min_delay, self.reconnect_max_delay = reconnect_min_delay, reconnect_max_delay
         self._reconnect_delay = reconnect_min_delay
         self.subscribed_topics: dict[str, int] = {}    # topic filter -> qos
+        self._outage_started: float | None = None      # monotonic time the broker was last lost, None while connected
+        self._dropped = self._queued = 0               # publishes not delivered / held during the current outage
+        self._connect_failures = 0                     # attempts since the broker was last reachable
 
         self.register_callback(self.handle_publish_remote, 'PUBLISH_REMOTE')
         self.register_callback(self.handle_subscribe_remote, 'SUBSCRIBE_REMOTE')
@@ -84,8 +93,12 @@ class MQTTProxy(GeventProtocolProxy):
                     try:
                         self.mqtt.reconnect()
                     except (OSError, ValueError) as e:
-                        _log.warning(f'{self.proxy_name}: Unable to connect to MQTT broker @ {self.host}:{self.port}'
-                                     f' ({e}). Retrying in {self._reconnect_delay:.0f}s.')
+                        self._broker_lost()
+                        self._connect_failures += 1
+                        # The first failure of an outage is a warning; the retries are not news and stay at debug.
+                        _log.log(logging.WARNING if self._connect_failures == 1 else logging.DEBUG,
+                                 f'{self.proxy_name}: Unable to connect to MQTT broker @ {self.host}:{self.port}'
+                                 f' ({e}). Retrying in {self._reconnect_delay:.0f}s (attempt {self._connect_failures}).')
                         sleep(self._reconnect_delay)
                         self._reconnect_delay = min(self._reconnect_delay * 2, self.reconnect_max_delay)
                         continue
@@ -104,7 +117,13 @@ class MQTTProxy(GeventProtocolProxy):
             _log.warning(f'{self.proxy_name}: Broker @ {self.host}:{self.port} refused connection: {reason_code}')
             return
         self._reconnect_delay = self.reconnect_min_delay
-        _log.info(f'{self.proxy_name}: Connected to MQTT broker @ {self.host}:{self.port}.')
+        outage = ''
+        if self._outage_started is not None:
+            held = f', {self._queued} held publish(es) are being delivered now' if self._queued else ''
+            outage = (f' after {time.monotonic() - self._outage_started:.0f}s unreachable ({self._connect_failures} attempt(s));'
+                      f' {self._dropped} QoS 0 publish(es) were dropped meanwhile{held}')
+        self._outage_started, self._dropped, self._queued, self._connect_failures = None, 0, 0, 0
+        _log.info(f'{self.proxy_name}: Connected to MQTT broker @ {self.host}:{self.port}{outage}.')
         if self.subscribed_topics:
             self._subscribe(list(self.subscribed_topics.items()))
 
@@ -112,6 +131,14 @@ class MQTTProxy(GeventProtocolProxy):
                       properties: Any):
         level = logging.INFO if self._stop else logging.WARNING
         _log.log(level, f'{self.proxy_name}: Disconnected from MQTT broker @ {self.host}:{self.port}: {reason_code}')
+        if not self._stop:
+            self._broker_lost()
+
+    def _broker_lost(self):
+        """Mark the start of an outage once; the counts it gathers are reported when the broker is back."""
+        if self._outage_started is None:
+            self._outage_started = time.monotonic()
+            self._dropped = self._queued = self._connect_failures = 0
 
     def on_message(self, client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage):
         """Forward a broker message to the manager. Must never raise into paho's network loop."""
@@ -192,7 +219,18 @@ class MQTTProxy(GeventProtocolProxy):
         qos = int(message.get('qos', self.default_qos))
         retain = bool(message.get('retain', False))
         info = self.mqtt.publish(topic, self._encode_payload(self._wire_payload(message)), qos=qos, retain=retain)
-        if info.rc != mqtt.MQTT_ERR_SUCCESS:
+        if info.rc == mqtt.MQTT_ERR_NO_CONN:
+            self._broker_lost()
+            if qos > 0:
+                # paho keeps QoS 1 and 2 messages and sends them once reconnected; nothing is lost, so no warning.
+                self._queued += 1
+                _log.debug(f'{self.proxy_name}: Publish to "{topic}" held until the broker is back (QoS {qos}).')
+                return
+            self._dropped += 1
+            _log.log(logging.WARNING if self._dropped == 1 else logging.DEBUG,
+                     f'{self.proxy_name}: Publish to "{topic}" dropped: not connected to the broker @ {self.host}:{self.port}.'
+                     f' QoS 0 publishes are dropped until it is back; the count is reported on reconnection.')
+        elif info.rc != mqtt.MQTT_ERR_SUCCESS:
             _log.warning(f'{self.proxy_name}: Publish to "{topic}" failed: {mqtt.error_string(info.rc)}')
 
     @callback
@@ -240,7 +278,8 @@ def launch_mqtt(parser: ArgumentParser) -> tuple[ArgumentParser, Callable]:
                         help='Default QoS for subscriptions and publications.')
     parser.add_argument('--reconnect-min-delay', type=float, default=1.0,
                         help='Initial delay in seconds between reconnection attempts.')
-    parser.add_argument('--reconnect-max-delay', type=float, default=60.0,
-                        help='Maximum delay in seconds between reconnection attempts.')
+    parser.add_argument('--reconnect-max-delay', type=float, default=10.0,
+                        help='Maximum delay in seconds between reconnection attempts. Each attempt itself waits up to the '
+                             'client\'s 5 s connect timeout, so this bounds how long a returned broker goes unnoticed.')
     return parser, run_proxy
 

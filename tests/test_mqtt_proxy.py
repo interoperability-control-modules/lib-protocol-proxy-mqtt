@@ -1,4 +1,5 @@
 import json
+import logging
 from types import SimpleNamespace
 from unittest import mock
 from uuid import uuid4
@@ -161,3 +162,48 @@ def test_bad_protocol_rejected():
     with pytest.raises(ValueError):
         MQTTProxy(proxy_id=uuid4(), token=uuid4(), manager_address='127.0.0.1', manager_port=1,
                   manager_id=uuid4(), manager_token=uuid4(), protocol='MQTTv9')
+
+
+def test_outage_is_reported_once_with_counts_on_reconnection(proxy, caplog):
+    """One warning for the first dropped publish, the rest at debug; QoS>0 publishes are held, not warned about; the
+    reconnection line carries the counts."""
+    caplog.set_level(logging.DEBUG)
+    proxy.on_disconnect(proxy.mqtt, None, None, 'Unspecified error', None)
+    proxy.mqtt.publish.return_value = SimpleNamespace(rc=mqtt.MQTT_ERR_NO_CONN)
+    for _ in range(5):
+        call(proxy, proxy.handle_publish_remote, {'topic': 't', 'payload': 'x'})
+    call(proxy, proxy.handle_publish_remote, {'topic': 't', 'payload': 'x', 'qos': 1})
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 2 and 'Disconnected' in warnings[0].message and 'dropped' in warnings[1].message
+    assert sum('held until' in r.message for r in caplog.records) == 1
+    proxy.on_connect(proxy.mqtt, None, None, SimpleNamespace(is_failure=False), None)
+    connected = next(r for r in caplog.records if 'Connected to MQTT broker' in r.message)
+    assert '5 QoS 0 publish(es) were dropped' in connected.message and '1 held publish(es)' in connected.message
+    assert proxy._outage_started is None and proxy._dropped == 0
+    # a publish failure for any other reason is still a warning each time
+    proxy.mqtt.publish.return_value = SimpleNamespace(rc=mqtt.MQTT_ERR_QUEUE_SIZE)
+    call(proxy, proxy.handle_publish_remote, {'topic': 't', 'payload': 'x', 'qos': 1})
+    assert 'failed: Message queue full' in caplog.records[-1].message and caplog.records[-1].levelno == logging.WARNING
+
+
+def test_connect_retries_warn_once_then_debug(proxy, caplog):
+    caplog.set_level(logging.DEBUG)
+    proxy.mqtt.socket.return_value = None
+    proxy.mqtt.reconnect.side_effect = OSError('timed out')
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 3:
+            proxy._stop = True
+    with mock.patch.object(module, 'sleep', fake_sleep):
+        proxy.main_loop()
+    attempts = [r for r in caplog.records if 'Unable to connect' in r.message]
+    assert [r.levelno for r in attempts] == [logging.WARNING, logging.DEBUG, logging.DEBUG]
+    assert 'attempt 3' in attempts[-1].message and proxy._connect_failures == 3 and proxy._outage_started is not None
+
+
+def test_default_backoff_tops_out_at_ten_seconds():
+    parser, _ = launch_mqtt(proxy_command_parser())
+    opts = parser.parse_args(['--proxy-id', uuid4().hex, '--proxy-name', 'n', '--manager-id', uuid4().hex])
+    assert opts.reconnect_max_delay == 10.0

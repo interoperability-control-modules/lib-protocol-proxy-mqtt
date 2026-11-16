@@ -26,8 +26,13 @@ Keyword arguments to `get_proxy` become command line options of the proxy proces
 
 String payloads are sent as UTF-8; other JSON values are serialized with `json.dumps`.
 Subscriptions are remembered and restored after every reconnection. The proxy reconnects to the
-broker with exponential backoff and registers with the manager independently of broker
-availability.
+broker with exponential backoff (`reconnect_min_delay` 1 s to `reconnect_max_delay` 10 s by
+default) and registers with the manager independently of broker availability.
+
+While the broker is unreachable, `PUBLISH_REMOTE` requests at QoS 0 are dropped and requests at
+QoS 1 or 2 are held by the client and sent on reconnection. The log carries one warning when the
+broker is lost (and one for the first dropped publish), the retries at debug level, and one line
+on reconnection with how long the broker was gone and how many publishes were dropped or held.
 
 ## Development
 
